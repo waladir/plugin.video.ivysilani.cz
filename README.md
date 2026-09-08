@@ -2,6 +2,9 @@
 <p>
 <h3>Kodi doplněk pro iVysílání</h3>
 <p>
+v2.3.6 (8.9.2026)<br>
+- změna typu streamu pro živé vysílání z DASH na HLS<br><br>
+
 v2.3.5 (15.8.2026)<br>
 - přidání archivu ČT4 Sport Plus<br><br>
 
@@ -13,7 +16,4 @@ v2.3.3 (18.7.2026)<br>
 
 v2.3.2 (24.6.2026)<br>
 - odstranění persistent query (díky Skyjet)<br><br>
-
-v2.3.1 (24.6.2026)<br>
-- změna API<br><br>
 </p>

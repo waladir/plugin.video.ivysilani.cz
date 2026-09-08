@@ -24,12 +24,18 @@ if len(sys.argv) > 1:
     _handle = int(sys.argv[1])
 
 def play_channel(channelId):
-    data = call_api(url = 'https://api.ceskatelevize.cz/video/v1/playlist-live/v1/stream-data/channel/' + channelId + '?canPlayDrm=false&streamType=dash&quality=web&maxQualityCount=5')
+    data = call_api(url = 'https://api.ceskatelevize.cz/video/v1/playlist-live/v1/stream-data/channel/' + channelId + '?canPlayDrm=false&streamType=hls&quality=web&maxQualityCount=5')
     if 'streamUrls' not in data or 'main' not in data['streamUrls']:
         xbmcgui.Dialog().notification('iVysílání', 'Chyba při přehrání pořadu', xbmcgui.NOTIFICATION_ERROR, 3000)
     else:
         url = data['streamUrls']['main']
-        play_url(url, [])
+        list_item = xbmcgui.ListItem(path = url)
+        list_item.setProperty('inputstream', 'inputstream.adaptive')
+        if PY2:
+            list_item.setProperty('inputstreamaddon', 'inputstream.adaptive')
+        list_item.setProperty('inputstream.adaptive.manifest_type', 'hls')        
+        list_item.setContentLookup(False)
+        xbmcplugin.setResolvedUrl(_handle, True, list_item)                        
 
 def play_id(id):
     if id == 'N/A':

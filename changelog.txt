@@ -1,3 +1,6 @@
+v2.3.6 (8.9.2026)
+- změna typu streamu pro živé vysílání z DASH na HLS
+
 v2.3.5 (15.8.2026)
 - přidání archivu ČT4 Sport Plus
 
@@ -9,6 +12,3 @@ v2.3.3 (18.7.2026)
 
 v2.3.2 (24.6.2026)
 - odstranění persistent query (díky Skyjet)
-
-v2.3.1 (24.6.2026)
-- změna API
