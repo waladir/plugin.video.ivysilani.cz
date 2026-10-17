@@ -124,11 +124,72 @@ def _tag(name):
     return '{{{}}}{}'.format(NS, name)
 
 
+def crypto_period_index(pssh):
+    """Read the public Widevine rotation index (protobuf field 7), not keys."""
+    offset = 28
+    if pssh[8] == 1:
+        offset += 4 + 16 * struct.unpack_from('>I', pssh, offset)[0]
+    length = struct.unpack_from('>I', pssh, offset)[0]
+    data = pssh[offset + 4:offset + 4 + length]
+    pos = 0
+
+    def integer():
+        nonlocal pos
+        value = 0
+        for shift in range(0, 70, 7):
+            if pos >= len(data):
+                break
+            byte = data[pos]
+            pos += 1
+            value |= (byte & 127) << shift
+            if byte < 128:
+                return value
+        raise ValueError('Invalid Widevine rotation metadata')
+
+    while pos < len(data):
+        tag = integer()
+        field, wire = tag >> 3, tag & 7
+        if wire == 0:
+            value = integer()
+            if field == 7:
+                return value
+        elif wire == 2:
+            size = integer()
+            pos += size
+        elif wire in (1, 5):
+            pos += 8 if wire == 1 else 4
+        else:
+            raise ValueError('Unsupported Widevine rotation metadata')
+        if pos > len(data):
+            raise ValueError('Truncated Widevine rotation metadata')
+    raise ValueError('Timeshift requires a Widevine crypto-period index')
+
+
+def _timeline(template):
+    timeline = template.find('d:SegmentTimeline', drm.DASH)
+    if timeline is None:
+        return None
+    first, end, duration, count = None, 0, None, 0
+    for entry in timeline.findall('d:S', drm.DASH):
+        own_duration = int(entry.attrib['d'])
+        start = int(entry.get('t', str(end)))
+        repeat = int(entry.get('r', '0'))
+        if own_duration <= 0 or repeat < 0 or (count and (start != end or own_duration != duration)):
+            raise ValueError('Timeshift requires a contiguous constant-duration timeline')
+        if first is None:
+            first, duration = start, own_duration
+        count += repeat + 1
+        end = start + (repeat + 1) * own_duration
+    if first is None or count > 12000:
+        raise ValueError('Unsupported timeshift timeline size')
+    return {'time': first, 'duration': duration, 'count': count}
+
+
 def _specs(root, period, manifest_url):
     specs = []
     for adaptation in period.findall('d:AdaptationSet', drm.DASH):
         for representation in adaptation.findall('d:Representation', drm.DASH):
-            base, attributes = manifest_url, {}
+            base, attributes, timeline = manifest_url, {}, None
             nodes = (root, period, adaptation, representation)
             for node in nodes:
                 location = node.find('d:BaseURL', drm.DASH)
@@ -136,14 +197,17 @@ def _specs(root, period, manifest_url):
                     base = urljoin(base, location.text.strip())
                 template = node.find('d:SegmentTemplate', drm.DASH)
                 if template is not None:
-                    if template.find('d:SegmentTimeline', drm.DASH) is not None:
-                        raise ValueError('Rotating live proxy requires duration-based templates')
+                    own_timeline = _timeline(template)
+                    if own_timeline is not None:
+                        timeline = own_timeline
                     attributes.update(template.attrib)
+            if timeline:
+                attributes['duration'] = str(timeline['duration'])
             protected = any(cp.get('schemeIdUri', '').lower() == drm.WIDEVINE_SCHEME
                             for node in nodes for cp in node.findall('d:ContentProtection', drm.DASH))
             specs.append({'id': representation.attrib['id'],
                           'base': base, 'template': attributes, 'representation': representation,
-                          'protected': protected,
+                          'protected': protected, 'timeline': timeline,
                           'mime': representation.get('mimeType', adaptation.get('mimeType', '')),
                           'bandwidth': int(representation.get('bandwidth', '0'))})
     return specs
@@ -168,11 +232,75 @@ class LiveManifest:
         if key not in self.metadata:
             template = spec['template']
             index = number - int(template.get('startNumber', '1'))
+            origin = spec['timeline']['time'] if spec['timeline'] else int(template.get('presentationTimeOffset', '0'))
             name = drm._media_name(template['media'], spec['representation'], number,
-                                   int(template.get('presentationTimeOffset', '0')) + index * int(template['duration']))
-            data, _, _ = drm._download(urljoin(spec['base'], name), self.user_agent, prefix=True)
-            self.metadata[key] = segment_metadata(data)
+                                   origin + index * int(template['duration']))
+            url = urljoin(spec['base'], name)
+            data, _, _ = drm._download(url, self.user_agent, prefix=True, prefix_bytes=8192)
+            try:
+                info = segment_metadata(data)
+            except ValueError:
+                # Some video moofs contain large sample-encryption tables.
+                data, _, _ = drm._download(url, self.user_agent, prefix=True)
+                info = segment_metadata(data)
+            self.metadata[key] = info
         return self.metadata[key]
+
+    def _history_groups(self, reference, first, last):
+        """Locate monotonic crypto-period boundaries by bisection, not a media scan."""
+        probes = 0
+
+        def metadata(number):
+            nonlocal probes
+            probes += 1
+            if probes > 512:
+                raise ValueError('Too many timeshift key boundaries')
+            info = self._metadata(reference, number)
+            info['rotation'] = crypto_period_index(info['pssh'])
+            return info
+
+        # Leave a small margin for expiration/publication at the CDN edges.
+        for _ in range(5):
+            try:
+                left = metadata(first)
+                break
+            except OSError:
+                first += 1
+        else:
+            raise ValueError('Timeshift history is unavailable')
+        for _ in range(5):
+            try:
+                right = metadata(last)
+                break
+            except OSError:
+                last -= 1
+        else:
+            raise ValueError('Timeshift live edge is unavailable')
+        intervals = [(first, last, left, right)]
+        boundaries = {first: left}
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            while intervals:
+                split = []
+                for low, high, a, b in intervals:
+                    if a['rotation'] > b['rotation']:
+                        raise ValueError('Non-monotonic timeshift key rotation')
+                    if a['rotation'] == b['rotation']:
+                        if a['kid'] != b['kid']:
+                            raise ValueError('Multiple KIDs in one crypto-period')
+                        continue
+                    if low + 1 == high:
+                        boundaries[high] = b
+                    else:
+                        split.append((low, high, a, b, (low + high) // 2))
+                middles = list(executor.map(metadata, [item[4] for item in split]))
+                intervals = []
+                for (low, high, a, b, middle), info in zip(split, middles):
+                    intervals.extend(((low, middle, a, info), (middle, high, info, b)))
+        starts = sorted(boundaries)
+        groups = [dict(boundaries[number], first=number,
+                       last=starts[index + 1] - 1 if index + 1 < len(starts) else last)
+                  for index, number in enumerate(starts)]
+        return first, last, groups
 
     def manifest(self):
         with self.lock:
@@ -198,6 +326,7 @@ class LiveManifest:
                 raise ValueError('No protected representations')
             reference = min(protected, key=lambda spec: (not spec['mime'].startswith('audio/'), spec['bandwidth']))
             template = reference['template']
+            timeline = reference['timeline']
             scale, duration = int(template.get('timescale', '1')), int(template['duration'])
             start = int(template.get('startNumber', '1'))
             if scale <= 0 or duration <= 0:
@@ -205,38 +334,60 @@ class LiveManifest:
             for spec in specs:
                 own = spec['template']
                 if (int(own.get('duration', '0')) * scale != duration * int(own.get('timescale', '1'))
-                        or int(own.get('startNumber', '1')) != start):
+                        or int(own.get('startNumber', '1')) != start
+                        or bool(spec['timeline']) != bool(timeline)):
                     raise ValueError('Unaligned live tracks')
+                if timeline and ((spec['timeline']['time'] - int(own.get('presentationTimeOffset', '0'))) * scale
+                                 != (timeline['time'] - int(template.get('presentationTimeOffset', '0'))) * int(own.get('timescale', '1'))):
+                    raise ValueError('Unaligned timeshift timestamps')
             now = time.time() + self.clock_offset
             period_start = drm._duration(original.get('start', 'PT0S'))
             elapsed = now - drm._timestamp(root.attrib['availabilityStartTime']) - period_start
-            last = start + int(elapsed * scale / duration) - 1
+            source_time = timeline['time'] if timeline else int(template.get('presentationTimeOffset', '0'))
+            source_offset = source_time - int(template.get('presentationTimeOffset', '0'))
+            last = start + math.floor((elapsed * scale - source_offset) / duration) - 1
             window = drm._duration(root.get('timeShiftBufferDepth', 'PT76S'))
-            first = max(start, last - min(32, math.ceil(window * scale / duration)) + 1)
+            window_count = math.ceil(window * scale / duration)
+            if timeline and window_count > 12000:
+                raise ValueError('Timeshift window exceeds supported size')
+            # Boundary discovery takes a few seconds. Do not advertise the
+            # oldest CDN fragments that can expire before Kodi requests them.
+            history_count = window_count - math.ceil(30 * scale / duration) if timeline else min(32, window_count)
+            first = max(start, last - history_count + 1)
+            if first > last:
+                raise ValueError('No complete live segments')
 
             def probe(number):
                 try:
                     return number, self._metadata(reference, number)
                 except OSError:
                     return number, None  # Expired/unpublished edge segments are not advertised.
-            with ThreadPoolExecutor(max_workers=4) as executor:
-                available = dict((n, info) for n, info in executor.map(probe, range(first, last + 1)) if info)
-            if not available:
-                raise ValueError('No complete live segment metadata')
-            last = max(available)
-            first = last
-            while first - 1 in available:
-                first -= 1
             if self.groups and first > self.groups[-1]['last'] + 1:
                 self.groups.clear()
-            for number in range(first, last + 1):
-                if self.groups and number <= self.groups[-1]['last']:
-                    continue
-                info = available[number]
-                if not self.groups or self.groups[-1]['kid'] != info['kid']:
-                    self.groups.append(dict(info, first=number, last=number))
-                else:
-                    self.groups[-1]['last'] = number
+            if timeline and not self.groups:
+                first, last, self.groups = self._history_groups(reference, first, last)
+            else:
+                scan_first = max(first, self.groups[-1]['last'] + 1) if timeline and self.groups else first
+                with ThreadPoolExecutor(max_workers=4) as executor:
+                    available = dict((n, info) for n, info in executor.map(probe, range(scan_first, last + 1)) if info)
+                if not available and not self.groups:
+                    raise ValueError('No complete live segment metadata')
+                if available:
+                    last = max(available)
+                    if not timeline:
+                        first = last
+                        while first - 1 in available:
+                            first -= 1
+                for number in range(max(scan_first, first), last + 1):
+                    if self.groups and number <= self.groups[-1]['last']:
+                        continue
+                    info = available.get(number)
+                    if not info:
+                        break  # Retry unpublished edges on the next refresh.
+                    if not self.groups or self.groups[-1]['kid'] != info['kid']:
+                        self.groups.append(dict(info, first=number, last=number))
+                    else:
+                        self.groups[-1]['last'] = number
             self.groups = [group for group in self.groups if group['last'] >= first]
             # Validate each representation at key boundaries, not on every MPD refresh.
             jobs = [(spec, max(first, group['first']), group)
@@ -259,6 +410,8 @@ class LiveManifest:
                 root.remove(child)
             root.set('minimumUpdatePeriod', 'PT2S')
             root.set('suggestedPresentationDelay', 'PT12S')
+            if timeline:
+                root.set('timeShiftBufferDepth', 'PT{:.6f}S'.format(max(0, window - 30)))
             root.set('publishTime', datetime.fromtimestamp(now, timezone.utc).isoformat())
             ET.SubElement(root, _tag('Location')).text = self.local_url + '/manifest.mpd'
             active_inits = set()
@@ -266,7 +419,7 @@ class LiveManifest:
                 period = copy.deepcopy(original)
                 offset = group['first'] - start
                 period.set('id', '{}-{}'.format(original.get('id', 'ct'), group['first']))
-                period.set('start', 'PT{:.6f}S'.format(period_start + offset * duration / scale))
+                period.set('start', 'PT{:.6f}S'.format(period_start + (source_offset + offset * duration) / scale))
                 period.set('duration', 'PT{:.6f}S'.format((group['last'] - group['first'] + 1) * duration / scale))
                 for node in period.iter():
                     for child in list(node):
@@ -288,8 +441,11 @@ class LiveManifest:
                     for representation in reps:
                         spec = by_id[representation.attrib['id']]
                         attributes = dict(spec['template'])
-                        attributes['startNumber'] = str(group['first'])
-                        attributes['presentationTimeOffset'] = str(int(attributes.get('presentationTimeOffset', '0')) + offset * int(attributes['duration']))
+                        selected_first = max(first, group['first']) if timeline else group['first']
+                        attributes['startNumber'] = str(selected_first)
+                        own_origin = spec['timeline']['time'] if timeline else int(attributes.get('presentationTimeOffset', '0'))
+                        own_duration = int(attributes['duration'])
+                        attributes['presentationTimeOffset'] = str(own_origin + offset * own_duration)
                         attributes['media'] = urljoin(spec['base'], attributes['media'])
                         init_name = drm._media_name(attributes['initialization'], spec['representation'], group['first'], 0)
                         init_url = urljoin(spec['base'], init_name)
@@ -303,7 +459,14 @@ class LiveManifest:
                         for child in list(representation):
                             if child.tag in (_tag('SegmentTemplate'), _tag('ContentProtection')):
                                 representation.remove(child)
-                        ET.SubElement(representation, _tag('SegmentTemplate'), attributes)
+                        if timeline:
+                            attributes.pop('duration')
+                        output_template = ET.SubElement(representation, _tag('SegmentTemplate'), attributes)
+                        if timeline:
+                            output_timeline = ET.SubElement(output_template, _tag('SegmentTimeline'))
+                            ET.SubElement(output_timeline, _tag('S'), {
+                                't': str(own_origin + (selected_first - start) * own_duration),
+                                'd': str(own_duration), 'r': str(group['last'] - selected_first)})
                 root.append(period)
             root.extend(utc_timing)
             # A reader can still request an init from an older MPD snapshot.

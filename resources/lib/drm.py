@@ -25,9 +25,9 @@ def is_drm_stream(url):
                parse_qs(urlsplit(url).query).get('drmOnly', []))
 
 
-def _download(url, user_agent, prefix=False):
+def _download(url, user_agent, prefix=False, prefix_bytes=SEGMENT_PREFIX_LIMIT):
     headers = {'User-Agent': user_agent}
-    limit = SEGMENT_PREFIX_LIMIT if prefix else MANIFEST_LIMIT
+    limit = min(prefix_bytes, SEGMENT_PREFIX_LIMIT) if prefix else MANIFEST_LIMIT
     if prefix:
         headers['Range'] = 'bytes=0-{}'.format(limit - 1)
     with urlopen(Request(url, headers=headers), timeout=NETWORK_TIMEOUT) as response:

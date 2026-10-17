@@ -38,7 +38,11 @@ def play_channel(channelId):
     if 'streamUrls' not in data or 'main' not in data['streamUrls']:
         xbmcgui.Dialog().notification('iVysílání', 'Chyba při přehrání pořadu', xbmcgui.NOTIFICATION_ERROR, 3000)
     else:
-        play_url(data['streamUrls']['main'], manifest_type=manifest_type, live=True)
+        # The live-only CDN expires segments after ~76 seconds. The separate
+        # timeshift source retains the three-hour history used by the website.
+        urls = data['streamUrls']
+        source = urls.get('timeshift') if manifest_type == 'mpd' else None
+        play_url(source or urls['main'], manifest_type=manifest_type, live=True)
 
 def play_id(id):
     if id == 'N/A':

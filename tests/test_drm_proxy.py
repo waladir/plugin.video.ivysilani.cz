@@ -4,6 +4,7 @@ import http.client
 import struct
 import threading
 import unittest
+from email.utils import formatdate
 import xml.etree.ElementTree as ET
 from unittest.mock import patch
 
@@ -90,7 +91,7 @@ class ManifestTests(unittest.TestCase):
         clock.start()
         self.addCleanup(clock.stop)
 
-    def download(self, url, agent, prefix=False):
+    def download(self, url, agent, prefix=False, prefix_bytes=None):
         self.downloads.append((url, prefix))
         date = 'Sat, 17 Oct 2026 00:00:{:02d} GMT'.format(self.seconds)
         if url == 'https://source.test/mpd':
@@ -167,6 +168,77 @@ class ManifestTests(unittest.TestCase):
         self.state._metadata = metadata
         with self.assertRaisesRegex(ValueError, 'Independent track key rotation'):
             self.state.manifest()
+
+
+class TimeshiftTests(unittest.TestCase):
+    def setUp(self):
+        self.seconds = 11702
+        self.downloads = []
+        self.state = drm_proxy.LiveManifest('https://source.test/mpd', 'test-UA', 'http://127.0.0.1:1234/secret')
+        self.root = ET.fromstring(MANIFEST)
+        self.root.set('timeShiftBufferDepth', 'PT10800S')
+        for template in self.root.findall('.//d:SegmentTemplate', drm.DASH):
+            template.attrib.pop('duration')
+            template.set('timescale', '1000')
+            template.set('startNumber', '100000')
+            timeline = ET.SubElement(template, drm_proxy._tag('SegmentTimeline'))
+            ET.SubElement(timeline, drm_proxy._tag('S'), {'t': '900000', 'd': '2000', 'r': '5399'})
+        for patcher in (patch.object(drm, '_download', side_effect=self.download),
+                        patch.object(drm_proxy.time, 'time', side_effect=lambda: 1792195200 + self.seconds)):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def download(self, url, agent, prefix=False, prefix_bytes=None):
+        self.downloads.append(url)
+        date = formatdate(1792195200 + self.seconds, usegmt=True)
+        if url == 'https://source.test/mpd':
+            return ET.tostring(self.root), url, date
+        if url.endswith('IS.mp4'):
+            return initialization('/a/' in url), url, date
+        number = int(url.rsplit('/', 1)[-1].split('.')[0])
+        index = (number - 100000) // 300
+        kid = bytes([index + 1]) * 16
+        payload = b'\x22\x06public\x38' + bytes([index])
+        init_data = box(b'pssh', bytes(4) + drm.WIDEVINE_ID + struct.pack('>I', len(payload)) + payload)
+        tfdt = box(b'tfdt', b'\x01\0\0\0' + struct.pack('>Q', 900000 + (number - 100000) * 2000))
+        seig = box(b'sgpd', b'\x01\0\0\0seig' + struct.pack('>II', 20, 1) + b'\0\0\x01\x08' + kid)
+        return box(b'moof', box(b'traf', tfdt + seig) + init_data), url, date
+
+    def manifest(self):
+        self.state.refreshed_at = 0
+        return ET.fromstring(self.state.manifest())
+
+    def test_hour_back_seek_maps_to_historical_kid_and_original_sample_time(self):
+        root = self.manifest()
+        target = self.seconds - 3600
+        period = next(p for p in root.findall('d:Period', drm.DASH)
+                      if drm._duration(p.get('start')) <= target < drm._duration(p.get('start')) + drm._duration(p.get('duration')))
+        template = period.find('.//d:Representation/d:SegmentTemplate', drm.DASH)
+        entry = template.find('d:SegmentTimeline/d:S', drm.DASH)
+        self.assertEqual(int(entry.get('t')) / 1000, drm._duration(period.get('start')))
+        self.assertEqual(template.get('presentationTimeOffset'), entry.get('t'))
+        init_id = template.get('initialization').rsplit('/', 1)[-1][:-4]
+        self.assertIn(bytes([13]) * 16, self.state.initialization(init_id))
+        # Three hours contain 5400 fragments, but only boundaries are probed.
+        self.assertLess(len(self.downloads), 400)
+        self.assertEqual(len(root.findall('d:Period', drm.DASH)), 19)
+
+    def test_refresh_extends_timeline_without_changing_period_ids_or_refetching_history(self):
+        before = self.manifest().findall('d:Period', drm.DASH)
+        previous_id = before[-1].get('id')
+        previous_calls = len(self.downloads)
+        self.seconds += 4
+        after = self.manifest().findall('d:Period', drm.DASH)
+        self.assertEqual(after[-1].get('id'), previous_id)
+        self.assertEqual(drm._duration(after[-1].get('duration')) - drm._duration(before[-1].get('duration')), 4)
+        self.assertLessEqual(len(self.downloads) - previous_calls, 2)
+        self.assertEqual(sum(url == 'https://source.test/mpd' for url in self.downloads), 1)
+        # Sliding oldest entry stays within the CDN history while its period ID/PTO remain stable.
+        old_template = before[0].find('.//d:Representation/d:SegmentTemplate', drm.DASH)
+        new_template = after[0].find('.//d:Representation/d:SegmentTemplate', drm.DASH)
+        self.assertEqual(before[0].get('id'), after[0].get('id'))
+        self.assertEqual(old_template.get('presentationTimeOffset'), new_template.get('presentationTimeOffset'))
+        self.assertEqual(int(new_template.get('startNumber')) - int(old_template.get('startNumber')), 2)
 
 
 class HttpTests(unittest.TestCase):

@@ -55,11 +55,12 @@ class PlaybackTests(unittest.TestCase):
     def test_protected_live_switches_fairplay_hls_to_widevine_dash(self):
         hls = 'https://cdn.test/?drmOnly=true&encryption=fp'
         dash = 'https://cdn.test/?drmOnly=true&encryption=wv'
-        self.api.side_effect = [{'streamUrls': {'main': hls}}, {'streamUrls': {'main': dash}}]
+        timeshift = dash + '&contentType=timeshift'
+        self.api.side_effect = [{'streamUrls': {'main': hls}}, {'streamUrls': {'main': dash, 'timeshift': timeshift}}]
         self.stream['play_channel']('CH_1')
         self.assertEqual(self.api.call_count, 2)
         self.assertIn('streamType=dash&encryption=wv', self.api.call_args.kwargs['url'])
-        self.bootstrap.assert_called_once_with(dash, 'test-UA')
+        self.bootstrap.assert_called_once_with(timeshift, 'test-UA')
         self.item.setPath.assert_called_once_with('http://127.0.0.1:1234/session/manifest.mpd')
         self.assertNotIn('inputstream.adaptive.license_data', self.properties())
         self.assertEqual(self.properties()['inputstream.adaptive.license_type'], 'com.widevine.alpha')
