@@ -21,7 +21,7 @@ from resources.lib.api import call_api, call_graphql
 from resources.lib.items import get_item_data
 from resources.lib.utils import PY2, iso639map, ua
 from resources.lib.drm import is_drm_stream
-from resources.lib.drm_proxy import start_live_proxy
+from resources.lib.drm_proxy import start_drm_proxy
 
 if len(sys.argv) > 1:
     _handle = int(sys.argv[1])
@@ -99,17 +99,17 @@ def play_url(url, subtitles=None, manifest_type='mpd', live=False):
             return
         list_item.setProperty('inputstream.adaptive.license_type', 'com.widevine.alpha')
         list_item.setProperty('inputstream.adaptive.license_key', 'https://ivys-wvproxy.o2tv.cz/license?access_token=public|Origin=https%3A%2F%2Fwww.ceskatelevize.cz&Referer=https%3A%2F%2Fwww.ceskatelevize.cz%2F|R{SSM}|')
-        if live:
+        if manifest_type == 'mpd':
             try:
-                proxy_url = start_live_proxy(url, ua)
+                proxy_url = start_drm_proxy(url, ua)
             except (OSError, ValueError, KeyError) as exc:
                 # Network exceptions may contain signed URLs: log the type only.
-                xbmc.log('[iVysilani] Live DRM initialization failed ({})'.format(type(exc).__name__), xbmc.LOGERROR)
+                xbmc.log('[iVysilani] DRM initialization failed ({})'.format(type(exc).__name__), xbmc.LOGERROR)
                 xbmcgui.Dialog().notification('iVysílání', 'Nepodařilo se načíst inicializační data DRM', xbmcgui.NOTIFICATION_ERROR, 5000)
                 xbmcplugin.setResolvedUrl(_handle, False, list_item)
                 return
             list_item.setPath(proxy_url)
-            xbmc.log('[iVysilani] Live DRM: rotating KIDs supplied through local manifest/init adapter', xbmc.LOGINFO)
+            xbmc.log('[iVysilani] DRM: local manifest/init adapter enabled', xbmc.LOGINFO)
     list_item.setMimeType('application/dash+xml' if manifest_type == 'mpd' else 'application/vnd.apple.mpegurl')
     list_item.setProperty('inputstream', 'inputstream.adaptive')
     if PY2:

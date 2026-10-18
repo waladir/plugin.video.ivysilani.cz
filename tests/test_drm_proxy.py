@@ -82,7 +82,7 @@ class ManifestTests(unittest.TestCase):
     def setUp(self):
         self.seconds = 26
         self.downloads = []
-        self.state = drm_proxy.LiveManifest('https://source.test/mpd', 'test-UA',
+        self.state = drm_proxy.ManifestAdapter('https://source.test/mpd', 'test-UA',
                                             'http://127.0.0.1:1234/secret')
         self.patcher = patch.object(drm, '_download', side_effect=self.download)
         self.patcher.start()
@@ -139,7 +139,8 @@ class ManifestTests(unittest.TestCase):
         self.assertEqual(periods[0].find('.//d:Representation/d:SegmentTemplate', drm.DASH).get('initialization'), old_url)
         self.assertNotEqual(periods[1].find('.//d:Representation/d:SegmentTemplate', drm.DASH).get('initialization'), old_url)
         self.assertEqual(sum(url == 'https://source.test/mpd' for url, _ in self.downloads), 1)
-        self.assertIn(KID_A, self.state.initialization(expired_url.rsplit('/', 1)[-1][:-4]))
+        with self.assertRaisesRegex(KeyError, 'expired'):
+            self.state.initialization(expired_url.rsplit('/', 1)[-1][:-4])
         for period, kid in zip(periods, (KID_B, KID_C)):
             template = period.find('.//d:Representation/d:SegmentTemplate', drm.DASH)
             init_id = template.get('initialization').rsplit('/', 1)[-1][:-4]
@@ -158,7 +159,7 @@ class ManifestTests(unittest.TestCase):
             self.state.initialization('https://example.test/private')
         self.assertEqual(self.downloads, [])
 
-    def test_rejects_divergent_video_key(self):
+    def test_rejects_divergent_video_key_when_initialization_is_requested(self):
         original = self.state._metadata
         def metadata(spec, number):
             info = dict(original(spec, number))
@@ -166,15 +167,20 @@ class ManifestTests(unittest.TestCase):
                 info['kid'] = KID_C
             return info
         self.state._metadata = metadata
+        root = self.manifest()
+        template = root.find('.//d:Representation/d:SegmentTemplate', drm.DASH)
+        init_id = template.get('initialization').rsplit('/', 1)[-1][:-4]
+        self.assertFalse(any(url.endswith('IS.mp4') for url, _ in self.downloads))
         with self.assertRaisesRegex(ValueError, 'Independent track key rotation'):
-            self.state.manifest()
+            self.state.initialization(init_id)
+        self.assertFalse(any(url.endswith('IS.mp4') for url, _ in self.downloads))
 
 
 class TimeshiftTests(unittest.TestCase):
     def setUp(self):
         self.seconds = 11702
         self.downloads = []
-        self.state = drm_proxy.LiveManifest('https://source.test/mpd', 'test-UA', 'http://127.0.0.1:1234/secret')
+        self.state = drm_proxy.ManifestAdapter('https://source.test/mpd', 'test-UA', 'http://127.0.0.1:1234/secret')
         self.root = ET.fromstring(MANIFEST)
         self.root.set('timeShiftBufferDepth', 'PT10800S')
         for template in self.root.findall('.//d:SegmentTemplate', drm.DASH):
@@ -218,7 +224,15 @@ class TimeshiftTests(unittest.TestCase):
         self.assertEqual(int(entry.get('t')) / 1000, drm._duration(period.get('start')))
         self.assertEqual(template.get('presentationTimeOffset'), entry.get('t'))
         init_id = template.get('initialization').rsplit('/', 1)[-1][:-4]
+        self.assertTrue(all('/v/' not in url for url in self.downloads))
+        self.assertFalse(any(url.endswith('IS.mp4') for url in self.downloads))
+        before = len(self.downloads)
         self.assertIn(bytes([13]) * 16, self.state.initialization(init_id))
+        requested = self.downloads[before:]
+        self.assertEqual(len(requested), 2)  # One header check and one init for the requested video.
+        self.assertTrue(all('/v/' in url for url in requested))
+        self.state.initialization(init_id)
+        self.assertEqual(len(self.downloads), before + 2)
         # Three hours contain 5400 fragments, but only boundaries are probed.
         self.assertLess(len(self.downloads), 400)
         self.assertEqual(len(root.findall('d:Period', drm.DASH)), 19)
@@ -239,6 +253,103 @@ class TimeshiftTests(unittest.TestCase):
         self.assertEqual(before[0].get('id'), after[0].get('id'))
         self.assertEqual(old_template.get('presentationTimeOffset'), new_template.get('presentationTimeOffset'))
         self.assertEqual(int(new_template.get('startNumber')) - int(old_template.get('startNumber')), 2)
+        init_id = new_template.get('initialization').rsplit('/', 1)[-1][:-4]
+        before_init = len(self.downloads)
+        self.state.initialization(init_id)
+        self.assertTrue(self.downloads[before_init].endswith('/v/' + new_template.get('startNumber') + '.m4s'))
+
+
+class StaticManifestTests(unittest.TestCase):
+    def setUp(self):
+        self.root = ET.fromstring(MANIFEST)
+        self.root.attrib = {'type': 'static', 'mediaPresentationDuration': 'PT5S'}
+        self.root.find('d:BaseURL', drm.DASH).text = '../vod/'
+        self.root.remove(self.root.find('d:Location', drm.DASH))
+        for template in self.root.findall('.//d:SegmentTemplate', drm.DASH):
+            template.attrib.pop('duration')
+            template.set('startNumber', '0')
+            timeline = ET.SubElement(template, drm_proxy._tag('SegmentTimeline'))
+            ET.SubElement(timeline, drm_proxy._tag('S'), {'t': '0', 'd': '180000', 'r': '1'})
+            ET.SubElement(timeline, drm_proxy._tag('S'), {'d': '90000'})
+        for cp in self.root.findall('.//d:ContentProtection', drm.DASH):
+            if cp.get('schemeIdUri') == drm.WIDEVINE_SCHEME:
+                ET.SubElement(cp, '{urn:mpeg:cenc:2013}pssh').text = base64.b64encode(pssh()).decode()
+        self.state = drm_proxy.ManifestAdapter('https://source.test/mpd', 'test-UA', 'http://127.0.0.1:1234/secret')
+        self.valid_init = False
+        self.downloads = []
+        patcher = patch.object(drm, '_download', side_effect=self.download)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def download(self, url, agent, prefix=False, prefix_bytes=None):
+        self.downloads.append((url, prefix, prefix_bytes))
+        if url == self.state.source:
+            return ET.tostring(self.root), 'https://cdn.test/redirect/manifest.mpd', None
+        kid = KID_B if '/v/' in url or '/second/' in url else KID_A
+        if url.endswith('IS.mp4'):
+            data = initialization('/a/' in url)
+            if self.valid_init:
+                data = drm_proxy.patch_init_kid(data, kid)
+        else:
+            data = media_segment(kid)
+        return data, url, None
+
+    def init_ids(self, root):
+        return [template.get('initialization').rsplit('/', 1)[-1][:-4]
+                for template in root.findall('.//d:Representation/d:SegmentTemplate', drm.DASH)]
+
+    def test_preserves_source_timeline_pssh_and_direct_media_without_fragment_probes(self):
+        document = self.state.manifest()
+        root = ET.fromstring(document)
+        self.assertEqual(len(self.downloads), 1)
+        self.assertEqual(root.attrib, self.root.attrib)
+        self.assertEqual(root.find('d:BaseURL', drm.DASH).text, 'https://cdn.test/vod/')
+        for before, after in zip(self.root.findall('d:Period', drm.DASH), root.findall('d:Period', drm.DASH)):
+            for rep in after.findall('.//d:Representation', drm.DASH):
+                override = rep.find('d:SegmentTemplate', drm.DASH)
+                self.assertEqual(set(override.attrib), {'initialization'})
+                rep.remove(override)
+            self.assertEqual(ET.tostring(before), ET.tostring(after))
+        self.state.refreshed_at = 0
+        self.assertEqual(self.state.manifest(), document)
+        self.assertEqual(len(self.downloads), 1)
+
+    def test_repairs_only_requested_zero_kid_track_and_caches_result(self):
+        root = ET.fromstring(self.state.manifest())
+        for init_id, expected in zip(self.init_ids(root), (KID_B, KID_A)):
+            before = len(self.downloads)
+            result = self.state.initialization(init_id)
+            self.assertEqual(result, drm_proxy.patch_init_kid(initialization(expected == KID_A), expected))
+            requested = self.downloads[before:]
+            self.assertEqual(len(requested), 2)
+            self.assertTrue(requested[1][0].endswith('/0.m4s'))
+            self.assertEqual(requested[1][1:], (True, 8192))
+            self.assertEqual(self.state.initialization(init_id), result)
+            self.assertEqual(len(self.downloads), before + 2)
+
+    def test_valid_init_is_unchanged_without_fetching_media(self):
+        self.valid_init = True
+        init_id = self.init_ids(ET.fromstring(self.state.manifest()))[0]
+        result = self.state.initialization(init_id)
+        self.assertEqual(result, drm_proxy.patch_init_kid(initialization(), KID_B))
+        self.assertEqual(len(self.downloads), 2)
+        self.assertFalse(any(prefix for _, prefix, _ in self.downloads))
+
+    def test_repeated_representation_ids_in_different_periods_do_not_share_metadata(self):
+        first = self.root.find('d:Period', drm.DASH)
+        second = copy.deepcopy(first)
+        for period, directory in ((first, 'first/'), (second, 'second/')):
+            ET.SubElement(period, drm_proxy._tag('BaseURL')).text = directory
+        second.set('id', 'second')
+        second.set('start', 'PT5S')
+        self.root.append(second)
+        init_ids = self.init_ids(ET.fromstring(self.state.manifest()))
+        self.assertEqual(len(set(init_ids)), 4)
+        first_audio = self.state.initialization(init_ids[1])
+        second_audio = self.state.initialization(init_ids[3])
+        self.assertEqual(first_audio, drm_proxy.patch_init_kid(initialization(True), KID_A))
+        self.assertEqual(second_audio, drm_proxy.patch_init_kid(initialization(True), KID_B))
+        self.assertEqual(len(self.state.metadata), 2)
 
 
 class HttpTests(unittest.TestCase):

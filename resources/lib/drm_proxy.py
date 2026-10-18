@@ -83,25 +83,19 @@ def segment_metadata(data):
     return {'kid': found[0], 'time': decode_time, 'pssh': pssh}
 
 
-def patch_init_kid(data, kid):
-    """Replace tenc.default_KID only; file size and all media bytes are unchanged."""
-    if len(kid) != 16 or not any(kid):
-        raise ValueError('Invalid initialization KID')
-    result = bytearray(data)
-    count = 0
+def _init_kid_offset(data):
+    """Locate the one encrypted track's tenc.default_KID."""
+    offsets = []
 
     def visit(start, end, depth=0):
-        nonlocal count
         if depth > 12:
             raise ValueError('MP4 initialization nesting limit exceeded')
         for kind, _, payload, stop in _boxes(data, start, end):
             child_start = None
             if kind == b'tenc':
-                # ČT CENC uses a per-sample IV; constant-IV/CBCS layouts differ.
-                if stop - payload != 24 or data[payload] not in (0, 1) or data[stop - 17] not in (8, 16):
+                if stop - payload < 24 or data[payload] not in (0, 1):
                     raise ValueError('Unsupported tenc layout')
-                result[stop - 16:stop] = kid
-                count += 1
+                offsets.append(payload + 8)
             elif kind in (b'moov', b'trak', b'mdia', b'minf', b'stbl', b'sinf', b'schi'):
                 child_start = payload
             elif kind == b'stsd':
@@ -115,8 +109,18 @@ def patch_init_kid(data, kid):
             if child_start is not None:
                 visit(child_start, stop, depth + 1)
     visit(0, len(data))
-    if count != 1:
+    if len(offsets) != 1:
         raise ValueError('Expected one encrypted track in initialization')
+    return offsets[0]
+
+
+def patch_init_kid(data, kid):
+    """Replace tenc.default_KID only; file size and all media bytes are unchanged."""
+    if len(kid) != 16 or not any(kid):
+        raise ValueError('Invalid initialization KID')
+    offset = _init_kid_offset(data)
+    result = bytearray(data)
+    result[offset:offset + 16] = kid
     return bytes(result)
 
 
@@ -165,10 +169,17 @@ def crypto_period_index(pssh):
     raise ValueError('Timeshift requires a Widevine crypto-period index')
 
 
-def _timeline(template):
+def _timeline(template, static=False):
     timeline = template.find('d:SegmentTimeline', drm.DASH)
     if timeline is None:
         return None
+    if static:
+        # Only the first fragment is needed to repair a VOD initialization.
+        # Leave all original runs (including variable durations) in the MPD.
+        entry = timeline.find('d:S', drm.DASH)
+        if entry is None:
+            raise ValueError('Empty VOD timeline')
+        return {'time': int(entry.get('t', '0')), 'duration': int(entry.attrib['d'])}
     first, end, duration, count = None, 0, None, 0
     for entry in timeline.findall('d:S', drm.DASH):
         own_duration = int(entry.attrib['d'])
@@ -197,7 +208,7 @@ def _specs(root, period, manifest_url):
                     base = urljoin(base, location.text.strip())
                 template = node.find('d:SegmentTemplate', drm.DASH)
                 if template is not None:
-                    own_timeline = _timeline(template)
+                    own_timeline = _timeline(template, root.get('type', 'static') == 'static')
                     if own_timeline is not None:
                         timeline = own_timeline
                     attributes.update(template.attrib)
@@ -213,7 +224,7 @@ def _specs(root, period, manifest_url):
     return specs
 
 
-class LiveManifest:
+class ManifestAdapter:
     def __init__(self, source, user_agent, local_url):
         self.source, self.user_agent, self.local_url = source, user_agent, local_url
         self.metadata = {}
@@ -223,19 +234,21 @@ class LiveManifest:
         self.source_document = None
         self.source_effective_url = None
         self.clock_offset = 0
+        self.first_available_number = None
         self.lock = threading.RLock()
         self.cached_manifest = None
+        self.is_static = False
         self.refreshed_at = 0
 
     def _metadata(self, spec, number):
-        key = (spec['id'], number)
+        template = spec['template']
+        index = number - int(template.get('startNumber', '1'))
+        origin = spec['timeline']['time'] if spec['timeline'] else int(template.get('presentationTimeOffset', '0'))
+        name = drm._media_name(template['media'], spec['representation'], number,
+                               origin + index * int(template.get('duration', '0')))
+        url = urljoin(spec['base'], name)
+        key = (url, number)
         if key not in self.metadata:
-            template = spec['template']
-            index = number - int(template.get('startNumber', '1'))
-            origin = spec['timeline']['time'] if spec['timeline'] else int(template.get('presentationTimeOffset', '0'))
-            name = drm._media_name(template['media'], spec['representation'], number,
-                                   origin + index * int(template['duration']))
-            url = urljoin(spec['base'], name)
             data, _, _ = drm._download(url, self.user_agent, prefix=True, prefix_bytes=8192)
             try:
                 info = segment_metadata(data)
@@ -302,9 +315,35 @@ class LiveManifest:
                   for index, number in enumerate(starts)]
         return first, last, groups
 
+    def _static_manifest(self, root, periods):
+        # Preserve source periods, protection data and complete timelines.
+        # A representation-level init override inherits the rest in ISA.
+        for index, period in enumerate(periods):
+            for spec in _specs(root, period, self.source_effective_url):
+                if not spec['protected']:
+                    continue
+                attributes = spec['template']
+                first = int(attributes.get('startNumber', '1'))
+                name = drm._media_name(attributes['initialization'], spec['representation'], first, 0)
+                init_id = hashlib.sha256(('{}:{}'.format(index, spec['id'])).encode()).hexdigest()[:32]
+                self.initializations[init_id] = (urljoin(spec['base'], name), None, spec, first, None)
+                template = spec['representation'].find('d:SegmentTemplate', drm.DASH)
+                if template is None:
+                    template = ET.SubElement(spec['representation'], _tag('SegmentTemplate'))
+                template.set('initialization', self.local_url + '/init/' + init_id + '.mp4')
+        if not self.initializations:
+            raise ValueError('No protected representations')
+        base = root.find('d:BaseURL', drm.DASH)
+        if base is None:
+            base = ET.Element(_tag('BaseURL'))
+            root.insert(0, base)
+        base.text = urljoin(self.source_effective_url, (base.text or '').strip())
+        self.cached_manifest = ET.tostring(root, encoding='utf-8', xml_declaration=True)
+        return self.cached_manifest
+
     def manifest(self):
         with self.lock:
-            if self.cached_manifest and time.monotonic() - self.refreshed_at < 1:
+            if self.cached_manifest and (self.is_static or time.monotonic() - self.refreshed_at < 1):
                 return self.cached_manifest
             # ČT can alternate packager timelines between identical MPD requests
             # (AST, Period id/start and startNumber all change). Pin one template
@@ -317,6 +356,9 @@ class LiveManifest:
                     self.clock_offset = parsedate_to_datetime(date).timestamp() - time.time()
             root = ET.fromstring(self.source_document)
             periods = root.findall('d:Period', drm.DASH)
+            self.is_static = root.get('type', 'static') == 'static'
+            if self.is_static:
+                return self._static_manifest(root, periods)
             if root.get('type') != 'dynamic' or len(periods) != 1:
                 raise ValueError('Expected one source live DASH period')
             original = periods[0]
@@ -389,19 +431,7 @@ class LiveManifest:
                     else:
                         self.groups[-1]['last'] = number
             self.groups = [group for group in self.groups if group['last'] >= first]
-            # Validate each representation at key boundaries, not on every MPD refresh.
-            jobs = [(spec, max(first, group['first']), group)
-                    for group in self.groups for spec in protected]
-            def validate(job):
-                spec, number, group = job
-                if spec['id'] in group.get('validated', set()):
-                    return
-                info = self._metadata(spec, number)
-                if info['kid'] != group['kid']:
-                    raise ValueError('Independent track key rotation is not supported')
-                group.setdefault('validated', set()).add(spec['id'])
-            with ThreadPoolExecutor(max_workers=4) as executor:
-                list(executor.map(validate, jobs))
+            self.first_available_number = first
             utc_timing = root.findall('d:UTCTiming', drm.DASH)
             for child in list(root):
                 if child.tag in (_tag('Period'), _tag('BaseURL'), _tag('Location')):
@@ -451,7 +481,10 @@ class LiveManifest:
                         init_url = urljoin(spec['base'], init_name)
                         if spec['protected']:
                             init_id = hashlib.sha256((period.get('id') + ':' + spec['id']).encode()).hexdigest()[:32]
-                            self.initializations[init_id] = (init_url, group['kid'])
+                            # Keep enough context to validate this track only
+                            # if Kodi requests its initialization (e.g. on seek).
+                            self.initializations[init_id] = (init_url, group['kid'], spec,
+                                                             group['first'], group['last'])
                             active_inits.add(init_id)
                             attributes['initialization'] = self.local_url + '/init/' + init_id + '.mp4'
                         else:
@@ -484,9 +517,20 @@ class LiveManifest:
             if init_id not in self.initializations:
                 raise KeyError('Unknown initialization')
             if init_id not in self.init_cache:
-                url, kid = self.initializations[init_id]
+                url, kid, spec, first, last = self.initializations[init_id]
+                if kid is not None:
+                    number = max(first, self.first_available_number)
+                    if number > last:
+                        raise KeyError('Initialization period has expired')
+                    info = self._metadata(spec, number)
+                    if info['kid'] != kid:
+                        raise ValueError('Independent track key rotation is not supported')
                 data, _, _ = drm._download(url, self.user_agent)
-                self.init_cache[init_id] = patch_init_kid(data, kid)
+                if kid is None:
+                    offset = _init_kid_offset(data)
+                    if not any(data[offset:offset + 16]):
+                        kid = self._metadata(spec, first)['kid']
+                self.init_cache[init_id] = patch_init_kid(data, kid) if kid is not None else data
             return self.init_cache[init_id]
 
 
@@ -498,7 +542,7 @@ class ProxyServer(ThreadingHTTPServer):
         self.token = token or uuid.uuid4().hex
         super().__init__(('127.0.0.1', 0), ProxyHandler)
         self.local_url = 'http://127.0.0.1:{}/{}'.format(self.server_port, self.token)
-        self.manifest_state = LiveManifest(source, user_agent, self.local_url)
+        self.manifest_state = ManifestAdapter(source, user_agent, self.local_url)
         self.last_request = time.monotonic()
 
 
@@ -528,7 +572,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self.send_error(404)
             return
         except (OSError, ValueError, ET.ParseError):
-            self.send_error(502, 'Cannot prepare live DRM metadata')
+            self.send_error(502, 'Cannot prepare DRM metadata')
             return
         self.send_response(200)
         self.send_header('Content-Type', mime)
@@ -541,8 +585,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
             pass
 
 
-def start_live_proxy(source, user_agent):
-    """Launch a separate Kodi script only when the user starts live DRM playback."""
+def start_drm_proxy(source, user_agent):
+    """Launch a separate Kodi script when the user starts protected DASH playback."""
     import xbmc
     import xbmcaddon
     import xbmcvfs
@@ -565,8 +609,8 @@ def start_live_proxy(source, user_agent):
             finally:
                 os.remove(ready_path)
             if ready.get('error'):
-                raise ValueError('Live DRM proxy failed to initialize')
+                raise ValueError('DRM proxy failed to initialize')
             return ready['url']
         if monitor.waitForAbort(0.1):
             break
-    raise ValueError('Live DRM proxy startup timed out')
+    raise ValueError('DRM proxy startup timed out')

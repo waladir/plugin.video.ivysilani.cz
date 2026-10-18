@@ -1,13 +1,9 @@
 # -*- coding: utf-8 -*-
 """Read Widevine initialization metadata, without requesting or decrypting keys."""
-import base64
 import re
 import struct
-import time
-import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
-from email.utils import parsedate_to_datetime
-from urllib.parse import parse_qs, urljoin, urlsplit
+from urllib.parse import parse_qs, urlsplit
 from urllib.request import Request, urlopen
 
 
@@ -114,89 +110,3 @@ def _media_name(template, representation, number, segment_time):
     if '$' in template:
         raise ValueError('Unsupported DASH segment placeholder')
     return template.replace('\x00', '$')
-
-
-def _segment_urls(root, manifest_url, now):
-    """Choose a small audio representation and a completed live segment."""
-    candidates = []
-    for period in root.findall('d:Period', DASH):
-        for adaptation in period.findall('d:AdaptationSet', DASH):
-            for representation in adaptation.findall('d:Representation', DASH):
-                mime = representation.get('mimeType', adaptation.get('mimeType', ''))
-                kind = representation.get('contentType', adaptation.get('contentType', ''))
-                if not (mime.startswith(('audio/', 'video/')) or kind in ('audio', 'video')):
-                    continue
-                nodes = (root, period, adaptation, representation)
-                protections = [cp for node in nodes for cp in node.findall('d:ContentProtection', DASH)]
-                if not any(cp.get('schemeIdUri', '').lower() == WIDEVINE_SCHEME for cp in protections):
-                    continue
-                candidates.append((not (mime.startswith('audio/') or kind == 'audio'),
-                                   int(representation.get('bandwidth', '0')), nodes))
-    if not candidates:
-        raise ValueError('No Widevine audio/video representation in live manifest')
-    _, _, nodes = min(candidates, key=lambda candidate: candidate[:2])
-    _, period, _, representation = nodes
-    base = manifest_url
-    attributes = {}
-    for node in nodes:
-        location = node.find('d:BaseURL', DASH)
-        if location is not None and location.text:
-            base = urljoin(base, location.text.strip())
-        template = node.find('d:SegmentTemplate', DASH)
-        if template is not None:
-            if template.find('d:SegmentTimeline', DASH) is not None:
-                raise ValueError('Live PSSH bootstrap requires a duration-based SegmentTemplate')
-            attributes.update(template.attrib)
-    timescale = int(attributes.get('timescale', '1'))
-    duration = int(attributes.get('duration', '0'))
-    if duration <= 0 or timescale <= 0 or not attributes.get('media'):
-        raise ValueError('Invalid live DASH segment template')
-    start_number = int(attributes.get('startNumber', '1'))
-    elapsed = now - _timestamp(root.attrib['availabilityStartTime']) - _duration(period.get('start', 'PT0S'))
-    # Leave three complete segments behind the live edge (CDN publication delay).
-    offset = max(0, int(elapsed * timescale / duration) - 3)
-    window = _duration(root.get('timeShiftBufferDepth', 'PT0S'))
-    if window and window < 4 * duration / timescale:
-        offset = max(0, int(elapsed * timescale / duration) - 1)
-    for behind in (0, 1):
-        index = max(0, offset - behind)
-        media = _media_name(attributes['media'], representation, start_number + index,
-                            int(attributes.get('presentationTimeOffset', '0')) + index * duration)
-        yield urljoin(base, media)
-
-
-def live_license_data(url, user_agent):
-    """Bootstrap only live DRM streams whose manifest has no Widevine PSSH.
-
-    The PSSH is passed to InputStream Adaptive; license requests and playback
-    remain with Kodi/Widevine. No video, content keys or licenses are cached.
-    """
-    manifest, effective_url, server_date = _download(url, user_agent)
-    try:
-        root = ET.fromstring(manifest)
-    except ET.ParseError as exc:
-        raise ValueError('Invalid DASH manifest') from exc
-    if root.get('type') != 'dynamic':
-        return None
-    for protection in root.findall('.//d:ContentProtection', DASH):
-        if protection.get('schemeIdUri', '').lower() == WIDEVINE_SCHEME:
-            if any(child.tag.rsplit('}', 1)[-1] == 'pssh' and (child.text or '').strip()
-                   for child in protection):
-                return None  # Adaptive already supports initialization from the manifest.
-    now = time.time()
-    if server_date:
-        try:
-            now = parsedate_to_datetime(server_date).timestamp()
-        except (ValueError, TypeError, OverflowError):
-            pass
-    last_error = None
-    for segment_url in _segment_urls(root, effective_url, now):
-        try:
-            data, _, _ = _download(segment_url, user_agent, prefix=True)
-            pssh = find_widevine_pssh(data)
-            if pssh:
-                return base64.b64encode(pssh).decode('ascii')
-            last_error = ValueError('No complete Widevine PSSH in segment prefix')
-        except OSError as exc:
-            last_error = exc
-    raise ValueError('Cannot bootstrap live Widevine initialization') from last_error

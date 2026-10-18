@@ -1,9 +1,6 @@
-import base64
-import io
 import struct
 import unittest
 from unittest.mock import MagicMock, patch
-import xml.etree.ElementTree as ET
 
 from resources.lib import drm
 
@@ -24,22 +21,6 @@ def pssh(system_id=drm.WIDEVINE_ID, version=0):
 PSSH = pssh()
 SEGMENT = box(b'styp', b'isom') + box(b'moof', box(b'traf', b'') +
                                       pssh(bytes(range(16))) + PSSH) + box(b'mdat', b'video')
-MPD = b'''<MPD xmlns="urn:mpeg:dash:schema:mpd:2011" type="dynamic"
- availabilityStartTime="2026-10-17T00:00:00Z" timeShiftBufferDepth="PT76.16S">
- <BaseURL>https://cdn.example.test/live/</BaseURL><Period start="PT3.538S">
- <AdaptationSet mimeType="video/mp4">
-  <ContentProtection schemeIdUri="urn:uuid:edef8ba9-79d6-4ace-a3c8-27dcd51d21ed"/>
-  <SegmentTemplate duration="345600" timescale="90000" startNumber="1000"
-   media="$RepresentationID$/$Number%06d$.m4s"/>
-  <Representation id="video" bandwidth="6000000"/>
- </AdaptationSet>
- <AdaptationSet mimeType="audio/mp4">
-  <ContentProtection schemeIdUri="urn:uuid:edef8ba9-79d6-4ace-a3c8-27dcd51d21ed"/>
-  <SegmentTemplate duration="345600" timescale="90000" startNumber="1000"
-   media="$RepresentationID$/$Number%06d$.m4s"/>
-  <Representation id="audio" bandwidth="128000"/>
- </AdaptationSet></Period></MPD>'''
-DATE = 'Sat, 17 Oct 2026 00:10:00 GMT'
 
 
 class DetectionTests(unittest.TestCase):
@@ -81,55 +62,7 @@ class PsshTests(unittest.TestCase):
         self.assertEqual(drm.find_widevine_pssh(SEGMENT[:-3]), PSSH)
 
 
-class LiveBootstrapTests(unittest.TestCase):
-    @patch.object(drm, '_download')
-    def test_selects_small_audio_and_complete_segment_using_server_time(self, download):
-        download.side_effect = [(MPD, 'https://redirect.test/mpd', DATE),
-                                (SEGMENT, 'https://cdn.example.test/segment', None)]
-        self.assertEqual(drm.live_license_data('https://api.test/manifest', 'test-UA'),
-                         base64.b64encode(PSSH).decode('ascii'))
-        self.assertEqual(download.call_count, 2)
-        download.assert_called_with('https://cdn.example.test/live/audio/001152.m4s',
-                                    'test-UA', prefix=True)
-
-    @patch.object(drm, '_download')
-    def test_manifest_pssh_avoids_segment_request(self, download):
-        data = MPD.replace(b'<ContentProtection schemeIdUri=',
-                           b'<ContentProtection xmlns:cenc="urn:mpeg:cenc:2013" schemeIdUri=', 1)
-        data = data.replace(b'51d21ed"/>', b'51d21ed"><cenc:pssh>' +
-                            base64.b64encode(PSSH) + b'</cenc:pssh></ContentProtection>', 1)
-        download.return_value = (data, 'https://cdn.test/mpd', DATE)
-        self.assertIsNone(drm.live_license_data('https://api.test/manifest', 'test-UA'))
-        download.assert_called_once()
-
-    @patch.object(drm, '_download')
-    def test_retries_adjacent_segment_after_download_error(self, download):
-        download.side_effect = [(MPD, 'https://cdn.test/mpd', DATE),
-                                OSError('not yet published'), (SEGMENT, 'https://cdn.test/a', None)]
-        self.assertTrue(drm.live_license_data('https://api.test/mpd', 'test-UA'))
-        self.assertIn('/001151.m4s', download.call_args.args[0])
-
-    @patch.object(drm, '_download')
-    def test_reports_missing_pssh(self, download):
-        download.side_effect = [(MPD, 'https://cdn.test/mpd', DATE),
-                                (box(b'mdat', b'video'), '', None),
-                                (box(b'mdat', b'video'), '', None)]
-        with self.assertRaisesRegex(ValueError, 'Cannot bootstrap'):
-            drm.live_license_data('https://api.test/mpd', 'test-UA')
-
-    @patch.object(drm, '_download')
-    def test_malformed_manifest_fails_cleanly(self, download):
-        download.return_value = (b'<bad', '', None)
-        with self.assertRaisesRegex(ValueError, 'Invalid DASH manifest'):
-            drm.live_license_data('https://api.test/mpd', 'test-UA')
-
-    def test_inherits_templates_and_resolves_relative_base_urls(self):
-        data = MPD.replace(b'https://cdn.example.test/live/', b'../live/')
-        root = ET.fromstring(data)
-        urls = list(drm._segment_urls(root, 'https://cdn.test/manifest/mpd',
-                                     drm._timestamp('2026-10-17T00:10:00Z')))
-        self.assertEqual(urls[0], 'https://cdn.test/live/audio/001152.m4s')
-
+class TimingTests(unittest.TestCase):
     def test_timestamp_offsets_and_duration(self):
         self.assertEqual(drm._timestamp('2026-10-17T02:00:00+02:00'),
                          drm._timestamp('2026-10-17T00:00:00Z'))

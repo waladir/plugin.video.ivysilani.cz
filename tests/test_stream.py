@@ -36,7 +36,7 @@ class PlaybackTests(unittest.TestCase):
         self.item = self.modules['xbmcgui'].ListItem.return_value
         self.resolved = self.modules['xbmcplugin'].setResolvedUrl
         self.bootstrap = MagicMock(return_value='http://127.0.0.1:1234/session/manifest.mpd')
-        self.stream['play_url'].__globals__['start_live_proxy'] = self.bootstrap
+        self.stream['play_url'].__globals__['start_drm_proxy'] = self.bootstrap
 
     def properties(self):
         return dict(call.args for call in self.item.setProperty.call_args_list)
@@ -66,11 +66,20 @@ class PlaybackTests(unittest.TestCase):
         self.assertEqual(self.properties()['inputstream.adaptive.license_type'], 'com.widevine.alpha')
         self.helper.assert_called_once_with('mpd', drm='com.widevine.alpha')
 
-    def test_vod_drm_does_not_bootstrap_live_pssh(self):
+    def test_vod_drm_uses_the_same_adapter_as_live(self):
         self.stream['play_url']('https://cdn.test/?drmOnly=true')
         self.helper.assert_called_once()
-        self.bootstrap.assert_not_called()
+        self.bootstrap.assert_called_once_with('https://cdn.test/?drmOnly=true', 'test-UA')
+        self.item.setPath.assert_called_once_with(self.bootstrap.return_value)
         self.assertNotIn('inputstream.adaptive.license_data', self.properties())
+
+    def test_clear_vod_keeps_direct_dash_without_helper_or_proxy(self):
+        self.stream['play_url']('https://cdn.test/?drmOnly=false')
+        self.helper.assert_not_called()
+        self.bootstrap.assert_not_called()
+        self.item.setPath.assert_not_called()
+        self.assertEqual(self.properties()['inputstream.adaptive.manifest_type'], 'mpd')
+        self.resolved.assert_called_once_with(42, True, self.item)
 
     def test_live_proxy_keeps_per_period_manifest_pssh_without_global_override(self):
         self.stream['play_url']('https://cdn.test/?drmOnly=true', live=True)

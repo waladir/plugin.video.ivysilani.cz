@@ -14,6 +14,7 @@ def serve(config_path):
     ready = config_path + '.ready'
     server = None
     thread = None
+    started = time.monotonic()
     try:
         with open(config_path) as source:
             config = json.load(source)
@@ -25,13 +26,22 @@ def serve(config_path):
         os.replace(temporary, ready)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
-        xbmc.log('[iVysilani] Live DRM proxy: per-key periods and initialization KIDs ready', xbmc.LOGINFO)
+        xbmc.log('[iVysilani] DRM proxy: ready in {:.2f}s; track KIDs checked on demand'.format(
+            time.monotonic() - started), xbmc.LOGINFO)
         monitor = xbmc.Monitor()
+        player = xbmc.Player()
         while not monitor.waitForAbort(1):
             if time.monotonic() - server.last_request > 90:
+                # Static VOD does not refresh its MPD. Keep its init routes
+                # available for a later seek/quality change in this playback.
+                try:
+                    if player.getPlayingFile() == server.local_url + '/manifest.mpd':
+                        continue
+                except RuntimeError:  # Playback stopped while checking it.
+                    pass
                 break
     except Exception as exc:
-        xbmc.log('[iVysilani] Live DRM proxy failed ({})'.format(type(exc).__name__), xbmc.LOGERROR)
+        xbmc.log('[iVysilani] DRM proxy failed ({})'.format(type(exc).__name__), xbmc.LOGERROR)
         if not os.path.exists(ready):
             temporary = ready + '.tmp'
             with open(temporary, 'w') as output:
