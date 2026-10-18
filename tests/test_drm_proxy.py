@@ -206,7 +206,8 @@ class TimeshiftTests(unittest.TestCase):
         kid = bytes([index + 1]) * 16
         payload = b'\x22\x06public\x38' + bytes([index])
         init_data = box(b'pssh', bytes(4) + drm.WIDEVINE_ID + struct.pack('>I', len(payload)) + payload)
-        tfdt = box(b'tfdt', b'\x01\0\0\0' + struct.pack('>Q', 900000 + (number - 100000) * 2000))
+        gap = sum(size for boundary, size in getattr(self, 'gaps', []) if number >= boundary)
+        tfdt = box(b'tfdt', b'\x01\0\0\0' + struct.pack('>Q', 900000 + (number - 100000) * 2000 + gap))
         seig = box(b'sgpd', b'\x01\0\0\0seig' + struct.pack('>II', 20, 1) + b'\0\0\x01\x08' + kid)
         return box(b'moof', box(b'traf', tfdt + seig) + init_data), url, date
 
@@ -257,6 +258,65 @@ class TimeshiftTests(unittest.TestCase):
         before_init = len(self.downloads)
         self.state.initialization(init_id)
         self.assertTrue(self.downloads[before_init].endswith('/v/' + new_template.get('startNumber') + '.m4s'))
+
+    def add_gaps(self):
+        self.gaps = [(101528, 1284), (102090, 628)]
+        for template in self.root.findall('.//d:SegmentTemplate', drm.DASH):
+            timeline = template.find('d:SegmentTimeline', drm.DASH)
+            timeline.clear()
+            for timestamp, repeat in ((900000, 1527), (3957284, 561), (5081912, 3309)):
+                ET.SubElement(timeline, drm_proxy._tag('S'), {'t': str(timestamp), 'd': '2000', 'r': str(repeat)})
+
+    def test_gaps_preserve_sample_timestamps_period_timing_and_advancing_live_edge(self):
+        self.add_gaps()
+        root = self.manifest()
+        samples = {}
+        for period in root.findall('d:Period', drm.DASH):
+            template = period.find('.//d:Representation/d:SegmentTemplate', drm.DASH)
+            number = int(template.get('startNumber'))
+            entries = template.findall('d:SegmentTimeline/d:S', drm.DASH)
+            for entry in entries:
+                for offset in range(int(entry.get('r')) + 1):
+                    self.assertNotIn(number, samples)
+                    samples[number] = int(entry.get('t')) + offset * 2000
+                    number += 1
+            origin = int(template.get('presentationTimeOffset'))
+            self.assertAlmostEqual(drm._duration(period.get('start')), origin / 1000)
+            self.assertAlmostEqual(drm._duration(period.get('duration')),
+                                   (samples[number - 1] + 2000 - origin) / 1000)
+        self.assertEqual([samples[n] for n in (101527, 101528, 102089, 102090)],
+                         [3954000, 3957284, 5079284, 5081912])
+        self.assertEqual(max(samples), 105399)  # The gaps must not advance the edge by a segment.
+        self.assertEqual(len(samples), max(samples) - min(samples) + 1)
+        self.assertGreaterEqual(samples[min(samples)] / 1000, self.seconds - 10800 + 30)
+        # A gap is inside a key period: retain both S runs and the same KID.
+        crossing = next(p for p in root.findall('d:Period', drm.DASH)
+                        if len(p.findall('.//d:Representation/d:SegmentTemplate/d:SegmentTimeline/d:S', drm.DASH)) > 2)
+        init_url = crossing.find('.//d:Representation/d:SegmentTemplate', drm.DASH).get('initialization')
+        self.state.initialization(init_url.rsplit('/', 1)[-1][:-4])
+        self.seconds += 4
+        refreshed = self.manifest().findall('d:Period', drm.DASH)
+        before = root.findall('d:Period', drm.DASH)[-1]
+        self.assertEqual(refreshed[-2].get('id'), before.get('id'))
+        self.assertEqual(refreshed[-1].get('id'), '3-105400')
+        before_end = drm._duration(before.get('start')) + drm._duration(before.get('duration'))
+        after_end = drm._duration(refreshed[-1].get('start')) + drm._duration(refreshed[-1].get('duration'))
+        self.assertAlmostEqual(after_end - before_end, 4)
+
+    def test_rejects_tracks_with_different_gap_positions(self):
+        self.add_gaps()
+        entry = self.root.find('.//d:SegmentTimeline', drm.DASH)[1]
+        entry.set('t', str(int(entry.get('t')) + 1))
+        with self.assertRaisesRegex(ValueError, 'Unaligned timeshift timestamps'):
+            self.manifest()
+
+    def test_rejects_overlaps_and_variable_duration_in_dynamic_timeline(self):
+        for timestamp, duration in ((899999, 2000), (902000, 1000)):
+            template = ET.fromstring('<SegmentTemplate xmlns="urn:mpeg:dash:schema:mpd:2011">'
+                                    '<SegmentTimeline><S t="900000" d="2000"/>'
+                                    '<S t="{}" d="{}"/></SegmentTimeline></SegmentTemplate>'.format(timestamp, duration))
+            with self.assertRaisesRegex(ValueError, 'non-overlapping constant-duration'):
+                drm_proxy._timeline(template)
 
 
 class StaticManifestTests(unittest.TestCase):

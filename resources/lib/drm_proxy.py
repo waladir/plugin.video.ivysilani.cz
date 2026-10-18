@@ -181,19 +181,44 @@ def _timeline(template, static=False):
             raise ValueError('Empty VOD timeline')
         return {'time': int(entry.get('t', '0')), 'duration': int(entry.attrib['d'])}
     first, end, duration, count = None, 0, None, 0
+    runs = []
     for entry in timeline.findall('d:S', drm.DASH):
         own_duration = int(entry.attrib['d'])
         start = int(entry.get('t', str(end)))
         repeat = int(entry.get('r', '0'))
-        if own_duration <= 0 or repeat < 0 or (count and (start != end or own_duration != duration)):
-            raise ValueError('Timeshift requires a contiguous constant-duration timeline')
+        if own_duration <= 0 or repeat < 0 or (count and (start < end or own_duration != duration)):
+            raise ValueError('Timeshift requires non-overlapping constant-duration segments')
+        if not count or start != end:
+            runs.append((count, start))
         if first is None:
             first, duration = start, own_duration
         count += repeat + 1
         end = start + (repeat + 1) * own_duration
     if first is None or count > 12000:
         raise ValueError('Unsupported timeshift timeline size')
-    return {'time': first, 'duration': duration, 'count': count}
+    return {'time': first, 'duration': duration, 'count': count, 'runs': runs}
+
+
+def _segment_time(spec, number):
+    template, timeline = spec['template'], spec['timeline']
+    index = number - int(template.get('startNumber', '1'))
+    runs = timeline.get('runs', [(0, timeline['time'])]) if timeline else [(0, int(template.get('presentationTimeOffset', '0')))]
+    offset, origin = next((run for run in reversed(runs) if run[0] <= index), runs[0])
+    return origin + (index - offset) * int(template.get('duration', '0'))
+
+
+def _segment_number(spec, timestamp):
+    """Find the preceding segment; extend the pinned final run at the live edge."""
+    template, timeline = spec['template'], spec['timeline']
+    runs = timeline['runs'] if timeline else [(0, int(template.get('presentationTimeOffset', '0')))]
+    duration = int(template['duration'])
+    index = math.floor((timestamp - runs[0][1]) / duration)
+    for offset, origin in runs[1:]:
+        if timestamp < origin:
+            index = min(index, offset - 1)  # A timestamp in a gap precedes the next run.
+            break
+        index = offset + math.floor((timestamp - origin) / duration)
+    return int(template.get('startNumber', '1')) + index
 
 
 def _specs(root, period, manifest_url):
@@ -242,10 +267,8 @@ class ManifestAdapter:
 
     def _metadata(self, spec, number):
         template = spec['template']
-        index = number - int(template.get('startNumber', '1'))
-        origin = spec['timeline']['time'] if spec['timeline'] else int(template.get('presentationTimeOffset', '0'))
         name = drm._media_name(template['media'], spec['representation'], number,
-                               origin + index * int(template.get('duration', '0')))
+                               _segment_time(spec, number))
         url = urljoin(spec['base'], name)
         key = (url, number)
         if key not in self.metadata:
@@ -379,23 +402,29 @@ class ManifestAdapter:
                         or int(own.get('startNumber', '1')) != start
                         or bool(spec['timeline']) != bool(timeline)):
                     raise ValueError('Unaligned live tracks')
-                if timeline and ((spec['timeline']['time'] - int(own.get('presentationTimeOffset', '0'))) * scale
-                                 != (timeline['time'] - int(template.get('presentationTimeOffset', '0'))) * int(own.get('timescale', '1'))):
+                if timeline and ([(offset, (tick - int(own.get('presentationTimeOffset', '0'))) * scale)
+                                  for offset, tick in spec['timeline']['runs']]
+                                 != [(offset, (tick - int(template.get('presentationTimeOffset', '0'))) * int(own.get('timescale', '1')))
+                                     for offset, tick in timeline['runs']]):
                     raise ValueError('Unaligned timeshift timestamps')
             now = time.time() + self.clock_offset
             period_start = drm._duration(original.get('start', 'PT0S'))
             elapsed = now - drm._timestamp(root.attrib['availabilityStartTime']) - period_start
-            source_time = timeline['time'] if timeline else int(template.get('presentationTimeOffset', '0'))
-            source_offset = source_time - int(template.get('presentationTimeOffset', '0'))
-            last = start + math.floor((elapsed * scale - source_offset) / duration) - 1
+            presentation_offset = int(template.get('presentationTimeOffset', '0'))
+            last = _segment_number(reference, elapsed * scale + presentation_offset) - 1
             window = drm._duration(root.get('timeShiftBufferDepth', 'PT76S'))
             window_count = math.ceil(window * scale / duration)
             if timeline and window_count > 12000:
                 raise ValueError('Timeshift window exceeds supported size')
             # Boundary discovery takes a few seconds. Do not advertise the
             # oldest CDN fragments that can expire before Kodi requests them.
-            history_count = window_count - math.ceil(30 * scale / duration) if timeline else min(32, window_count)
-            first = max(start, last - history_count + 1)
+            if timeline:
+                cutoff = (elapsed - max(0, window - 30)) * scale + presentation_offset
+                first = max(start, _segment_number(reference, cutoff))
+                if _segment_time(reference, first) < cutoff:
+                    first += 1
+            else:
+                first = max(start, last - min(32, window_count) + 1)
             if first > last:
                 raise ValueError('No complete live segments')
 
@@ -447,10 +476,10 @@ class ManifestAdapter:
             active_inits = set()
             for group in self.groups:
                 period = copy.deepcopy(original)
-                offset = group['first'] - start
+                group_time = _segment_time(reference, group['first'])
                 period.set('id', '{}-{}'.format(original.get('id', 'ct'), group['first']))
-                period.set('start', 'PT{:.6f}S'.format(period_start + (source_offset + offset * duration) / scale))
-                period.set('duration', 'PT{:.6f}S'.format((group['last'] - group['first'] + 1) * duration / scale))
+                period.set('start', 'PT{:.6f}S'.format(period_start + (group_time - presentation_offset) / scale))
+                period.set('duration', 'PT{:.6f}S'.format((_segment_time(reference, group['last']) + duration - group_time) / scale))
                 for node in period.iter():
                     for child in list(node):
                         if child.tag == _tag('BaseURL'):
@@ -473,9 +502,8 @@ class ManifestAdapter:
                         attributes = dict(spec['template'])
                         selected_first = max(first, group['first']) if timeline else group['first']
                         attributes['startNumber'] = str(selected_first)
-                        own_origin = spec['timeline']['time'] if timeline else int(attributes.get('presentationTimeOffset', '0'))
                         own_duration = int(attributes['duration'])
-                        attributes['presentationTimeOffset'] = str(own_origin + offset * own_duration)
+                        attributes['presentationTimeOffset'] = str(_segment_time(spec, group['first']))
                         attributes['media'] = urljoin(spec['base'], attributes['media'])
                         init_name = drm._media_name(attributes['initialization'], spec['representation'], group['first'], 0)
                         init_url = urljoin(spec['base'], init_name)
@@ -497,9 +525,12 @@ class ManifestAdapter:
                         output_template = ET.SubElement(representation, _tag('SegmentTemplate'), attributes)
                         if timeline:
                             output_timeline = ET.SubElement(output_template, _tag('SegmentTimeline'))
-                            ET.SubElement(output_timeline, _tag('S'), {
-                                't': str(own_origin + (selected_first - start) * own_duration),
-                                'd': str(own_duration), 'r': str(group['last'] - selected_first)})
+                            boundaries = [selected_first] + [start + offset for offset, _ in spec['timeline']['runs'][1:]
+                                                             if selected_first < start + offset <= group['last']] + [group['last'] + 1]
+                            for begin, end in zip(boundaries, boundaries[1:]):
+                                ET.SubElement(output_timeline, _tag('S'), {
+                                    't': str(_segment_time(spec, begin)),
+                                    'd': str(own_duration), 'r': str(end - begin - 1)})
                 root.append(period)
             root.extend(utc_timing)
             # A reader can still request an init from an older MPD snapshot.

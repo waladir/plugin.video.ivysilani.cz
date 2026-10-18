@@ -32,14 +32,27 @@ InputStream Adaptive and the platform CDM handle licensing and decoding.
 - **Dynamic live/timeshift:** groups fragments into stable per-key periods,
   supplying PSSH, `cenc.default_KID` and patched initialization. Original
   segment numbers and timestamps are preserved. Live-only inspects at most
-  32 reference fragments. Timeshift requires a contiguous, constant-duration
-  SegmentTimeline and locates boundaries by bisecting public Widevine
+  32 reference fragments. Timeshift requires non-overlapping, constant-duration
+  segments and locates key boundaries by bisecting public Widevine
   crypto-period indices (at most 512 probes). Other tracks are checked only
   when their init is requested, against a still-available fragment of the
   expected key period. Successful initializations are cached. Updates inspect
   only new reference fragments. The oldest edge has a 30-second safety margin.
   Tracks must be aligned with matching KIDs; one source period and at most
   12000 fragments are supported. Unsupported layouts fail explicitly.
+
+Positive gaps in live SegmentTimeline runs are retained. A compact list of
+run offsets/timestamps maps segment numbers to real sample times; each key
+period emits the corresponding original S runs, including gaps. Period timing,
+the live edge and the oldest available segment use these timestamps. On ČT2,
+both observed gaps were inside crypto periods, so source S boundaries cannot
+substitute for DRM key boundaries. The corrected MPD and current/historical
+audio/video inits passed checks against actual ČT2 metadata. After deployment,
+macOS logs confirmed ČT1/ČT2 startup without adapter or decryption failures.
+A subsequent ČT1 session completed four cross-period seeks and license updates,
+but logged an audio renderer timeout after the last seek, alongside video
+buffer timeouts and decoder reopenings. Seeking across the actual ČT2 gaps
+and playback of this gap fix on Android remain unverified.
 
 Fragment metadata reads start at 8 KiB, with a bounded 128 KiB retry for larger
 headers. Manifest/init reads are limited to 1 MiB. Media payloads are not scanned.
@@ -70,6 +83,12 @@ patched init. A separate subtitle error remains: the addon saves the API's first
 subtitle file (JSON for this asset) as `.sub`, which Kodi cannot parse.
 The archive fix on Android remains unverified. Uninterrupted multi-hour playback,
 automatic live key transitions and CDN timeline rollovers also remain unverified.
+
+The complete historical key map is prepared before playback to preserve native
+three-hour seeking. ISA 21.5.25 appends newly discovered periods instead of
+inserting older periods in time order, so deferring the history until seek has
+no verified safe implementation in this manifest/init adapter. Using the
+live-only source would reduce history; its startup time has not been measured.
 
 References:
 
