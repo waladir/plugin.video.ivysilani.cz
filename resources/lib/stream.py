@@ -96,17 +96,20 @@ def play_url(url, subtitles=[]):
             os.makedirs(addon_userdata_dir)    
         filelist = os.listdir(addon_userdata_dir)
         for filename in filelist:
-            if filename.endswith(".sub"):
-                os.remove(os.path.join(addon_userdata_dir, filename))            
+            if filename.endswith((".sub", ".vtt", ".srt")):
+                os.remove(os.path.join(addon_userdata_dir, filename))
         subs = []
         for sub_lang in subtitles:
             lang = sub_lang['language']
-            for sub in sub_lang['files']:
-                response = urlopen(sub['url'])
-                filename = os.path.join(addon_userdata_dir, iso639map[lang] + '.sub') 
-                subs.append(filename)
-                with open(filename, 'wb') as f:
-                    f.write(response.read())
-                break  # There are multiple formats, but we are only interested in one per language
+            # There are multiple formats (json, ttml, vtt), but Kodi can display only vtt or srt
+            files = {sub['format']: sub['url'] for sub in sub_lang['files']}
+            fmt = next((f for f in ('vtt', 'srt') if f in files), None)
+            if fmt is None:
+                continue
+            response = urlopen(files[fmt])
+            filename = os.path.join(addon_userdata_dir, iso639map[lang] + '.' + fmt)
+            subs.append(filename)
+            with open(filename, 'wb') as f:
+                f.write(response.read())
         list_item.setSubtitles(subs)
     xbmcplugin.setResolvedUrl(_handle, True, list_item)                        
