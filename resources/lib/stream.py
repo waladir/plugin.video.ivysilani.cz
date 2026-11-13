@@ -96,7 +96,7 @@ def play_url(url, subtitles=None, manifest_type='mpd'):
             xbmcplugin.setResolvedUrl(_handle, False, list_item)
             return
         list_item.setProperty('inputstream.adaptive.license_type', 'com.widevine.alpha')
-        list_item.setProperty('inputstream.adaptive.license_key', 'https://ivys-wvproxy.o2tv.cz/license?access_token=public|Origin=https%3A%2F%2Fwww.ceskatelevize.cz&Referer=https%3A%2F%2Fwww.ceskatelevize.cz%2F|R{SSM}|')
+        list_item.setProperty('inputstream.adaptive.license_key', 'https://ivys-wvproxy.o2tv.cz/license?access_token=public|Content-Type=application%2Foctet-stream&Origin=https%3A%2F%2Fwww.ceskatelevize.cz&Referer=https%3A%2F%2Fwww.ceskatelevize.cz%2F|R{SSM}|')
         if manifest_type == 'mpd':
             try:
                 proxy_url = start_drm_proxy(url, ua)
