@@ -1,4 +1,4 @@
-﻿<addon id="plugin.video.ivysilani.cz" name="iVysílání" provider-name="waladir" version="2.3.9">
+﻿<addon id="plugin.video.ivysilani.cz" name="iVysílání" provider-name="waladir" version="2.4.0">
   <requires>
     <import addon="xbmc.python" version="3.0.0"/>
     <import addon="script.module.inputstreamhelper" version="0.4.2"/>
@@ -15,6 +15,9 @@ Doplněk pro iVysílání České televize
     </description>    
     <platform>all</platform>
     <news>
+v.2.4.0 (14.11.2026)
+- oprava spouštení streamu s DRM (od asgeirr)
+
 v2.3.9 (23.10.2026)
 - oprava překlepu
 
@@ -27,9 +30,6 @@ v2.3.7 (19.10.2026)
 
 v2.3.6 (8.9.2026)
 - změna typu streamu pro živé vysílání z DASH na HLS
-
-v2.3.5 (15.8.2026)
-- přidání archivu ČT4 Sport Plus
 </news>
     <assets>
         <icon>icon.png</icon>

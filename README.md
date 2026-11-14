@@ -2,6 +2,9 @@
 <p>
 <h3>Kodi doplněk pro iVysílání</h3>
 <p>
+v.2.4.0 (14.11.2026)<br>
+- oprava spouštení streamu s DRM (od asgeirr)<br><br>
+
 v2.3.9 (23.10.2026)<br>
 - oprava překlepu<br><br>
 
@@ -14,7 +17,4 @@ v2.3.7 (19.10.2026)<br>
 
 v2.3.6 (8.9.2026)<br>
 - změna typu streamu pro živé vysílání z DASH na HLS<br><br>
-
-v2.3.5 (15.8.2026)<br>
-- přidání archivu ČT4 Sport Plus<br><br>
 </p>
